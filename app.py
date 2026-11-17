@@ -11,9 +11,9 @@ from html import escape
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-BOT_TOKEN = os.environ[322894971:AAF_vX7sLANWOEPgdhR_kkcDy_xWKF1ltNg]
-API_SECRET = os.environ[autoservicesecret]
-WEBHOOK_SECRET = os.environ[autoservicesecret2]
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+API_SECRET = os.environ["NOTIFIER_API_SECRET"]
+WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
 DB_PATH = os.getenv("DATABASE_PATH", "./data/notifier.sqlite3")
 
 # JSON: {"id-механика": "длинный-случайный-код-привязки"}
