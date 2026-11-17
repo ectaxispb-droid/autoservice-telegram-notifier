@@ -7,50 +7,71 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from html import escape
+from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-API_SECRET = os.environ["NOTIFIER_API_SECRET"]
-WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
-DB_PATH = os.getenv("DATABASE_PATH", "./data/notifier.sqlite3")
 
-# JSON: {"id-механика": "длинный-случайный-код-привязки"}
-LINK_CODES = json.loads(os.getenv("MECHANIC_LINK_CODES", "{}"))
+def required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Не задана обязательная переменная окружения: {name}")
+    return value
+
+
+BOT_TOKEN = required_env("TELEGRAM_BOT_TOKEN")
+API_SECRET = required_env("NOTIFIER_API_SECRET")
+WEBHOOK_SECRET = required_env("TELEGRAM_WEBHOOK_SECRET")
+
+DB_PATH = os.getenv("DATABASE_PATH", "/app/data/notifier.sqlite3")
+
+try:
+    LINK_CODES = json.loads(os.getenv("MECHANIC_LINK_CODES", "{}"))
+except json.JSONDecodeError as exc:
+    raise RuntimeError("MECHANIC_LINK_CODES должен содержать корректный JSON") from exc
+
+if not isinstance(LINK_CODES, dict):
+    raise RuntimeError('MECHANIC_LINK_CODES должен быть JSON-объектом, например {"123":"код"}')
+
 
 app = FastAPI(title="Autoservice Telegram Notifier")
 
 
 @contextmanager
 def db():
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    directory = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(directory, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("""
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS mechanics (
                 mechanic_id TEXT PRIMARY KEY,
                 chat_id TEXT NOT NULL,
                 linked_at INTEGER NOT NULL
             )
-        """)
+            """
+        )
         conn.commit()
         yield conn
     finally:
         conn.close()
 
 
-def telegram(method: str, payload: dict):
+def telegram(method: str, payload: dict) -> None:
     request = urllib.request.Request(
         f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
-        data=json.dumps(payload).encode(),
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
-            result = json.loads(response.read())
+            result = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError("Telegram API недоступен") from exc
 
@@ -75,19 +96,24 @@ def health():
 @app.post("/telegram/webhook")
 async def telegram_webhook(
     request: Request,
-    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
     if not x_telegram_bot_api_secret_token or not hmac.compare_digest(
-        x_telegram_bot_api_secret_token, WEBHOOK_SECRET
+        x_telegram_bot_api_secret_token,
+        WEBHOOK_SECRET,
     ):
-        raise HTTPException(403, "forbidden")
+        raise HTTPException(status_code=403, detail="forbidden")
 
-    update = await request.json()
+    try:
+        update = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_json")
+
     message = update.get("message") or {}
     text = message.get("text", "")
-    chat_id = message.get("chat", {}).get("id")
+    chat_id = (message.get("chat") or {}).get("id")
 
-    if not chat_id or not text.startswith("/start"):
+    if not chat_id or not isinstance(text, str) or not text.startswith("/start"):
         return {"ok": True}
 
     parts = text.split(maxsplit=1)
@@ -95,7 +121,8 @@ async def telegram_webhook(
 
     mechanic_id = next(
         (
-            mid for mid, candidate in LINK_CODES.items()
+            str(mid)
+            for mid, candidate in LINK_CODES.items()
             if hmac.compare_digest(str(candidate), code)
         ),
         None,
@@ -108,19 +135,24 @@ async def telegram_webhook(
                 INSERT INTO mechanics(mechanic_id, chat_id, linked_at)
                 VALUES (?, ?, ?)
                 ON CONFLICT(mechanic_id) DO UPDATE SET
-                    chat_id=excluded.chat_id,
-                    linked_at=excluded.linked_at
+                    chat_id = excluded.chat_id,
+                    linked_at = excluded.linked_at
                 """,
                 (mechanic_id, str(chat_id), int(time.time())),
             )
             conn.commit()
+
         reply = "Уведомления Autoservice подключены."
     else:
-        reply = "Для подключения откройте персональную ссылку от администратора Autoservice."
+        reply = (
+            "Для подключения откройте персональную ссылку "
+            "от администратора Autoservice."
+        )
 
     try:
         telegram("sendMessage", {"chat_id": chat_id, "text": reply})
     except RuntimeError:
+        # Webhook всё равно отвечает Telegram, чтобы не провоцировать повторы.
         pass
 
     return {"ok": True}
@@ -129,11 +161,11 @@ async def telegram_webhook(
 @app.post("/api/appointments")
 def notify(
     item: Appointment,
-    authorization: str | None = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
 ):
     expected = "Bearer " + API_SECRET
     if not authorization or not hmac.compare_digest(authorization, expected):
-        raise HTTPException(401, "unauthorized")
+        raise HTTPException(status_code=401, detail="unauthorized")
 
     with db() as conn:
         row = conn.execute(
@@ -142,17 +174,19 @@ def notify(
         ).fetchone()
 
     if not row:
-        raise HTTPException(404, "mechanic_not_linked")
+        raise HTTPException(status_code=404, detail="mechanic_not_linked")
 
     labels = {
         "new": "Новая запись",
         "updated": "Запись изменена",
         "cancelled": "Запись отменена",
     }
+
     lines = [
         f"<b>{labels[item.event_type]}</b>",
         f"Время: {escape(item.starts_at)}",
     ]
+
     if item.vehicle:
         lines.append(f"Автомобиль: {escape(item.vehicle)}")
     if item.description:
@@ -168,6 +202,6 @@ def notify(
             },
         )
     except RuntimeError:
-        raise HTTPException(502, "telegram_delivery_failed")
+        raise HTTPException(status_code=502, detail="telegram_delivery_failed")
 
     return {"ok": True}
