@@ -109,6 +109,10 @@ class EventRequest(BaseModel):
     starts_at: str = Field(default="", max_length=80)
     vehicle: str = Field(default="", max_length=160)
     description: str = Field(default="", max_length=500)
+    appointment_url: str = Field(default="", max_length=500)
+    client_name: str = Field(default="", max_length=200)
+    client_phone: str = Field(default="", max_length=40)
+    amount: Optional[float] = None
 
 
 @app.get("/health")
@@ -258,7 +262,7 @@ async def telegram_webhook(
                     (code_hash,),
                 )
                 conn.commit()
-                reply = "Уведомления Autoservice подключены."
+                reply = "🔔 Уведомления sto.autoimba.ru подключены."
 
     try:
         telegram("sendMessage", {"chat_id": chat_id, "text": reply})
@@ -277,33 +281,33 @@ def notify_event(
     verify_authorization(authorization)
 
     labels = {
-        "new": "Новая запись",
-        "updated": "Запись изменена",
-        "cancelled": "Запись отменена",
-        "completed_paid": "Заказ выполнен и оплачен",
-    }
-    label = labels.get(item.event_type, f"Событие: {item.event_type}")
+    "new": "🆕 Новая запись",
+    "updated": "✏️ Запись изменена",
+    "cancelled": "❌ Запись отменена",
+    "completed_paid": "✅ Заказ выполнен",
+}
+label = labels.get(item.event_type, f"🔔 Событие: {item.event_type}")
 
-    lines = [f"<b>{escape(label)}</b>"]
-    if item.event_id:
-        lines.append(f"Запись: {escape(item.event_id)}")
-    if item.starts_at:
-        lines.append(f"Время: {escape(item.starts_at)}")
-    if item.vehicle:
-        lines.append(f"Автомобиль: {escape(item.vehicle)}")
-    if item.description:
-        lines.append(f"Детали: {escape(item.description)}")
+lines = [f"<b>{escape(label)}</b>"]
 
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT chat_id FROM subscriptions WHERE tenant_id = ?",
-            (item.tenant_id,),
-        ).fetchall()
+if item.client_name:
+    lines.append(f"Клиент: {escape(item.client_name)}")
+if item.client_phone:
+    lines.append(f"Телефон: {escape(item.client_phone)}")
+if item.starts_at:
+    lines.append(f"Время: {escape(item.starts_at)}")
+if item.vehicle:
+    lines.append(f"Автомобиль: {escape(item.vehicle)}")
+if item.description:
+    lines.append(f"Детали: {escape(item.description)}")
+if item.amount is not None:
+    lines.append(f"Сумма: {item.amount:,.2f} ₽".replace(",", " "))
 
-    if not rows:
-        return {"ok": True, "sent": 0, "failed": 0}
+if item.appointment_url:
+    safe_url = escape(item.appointment_url, quote=True)
+    lines.append(f'<a href="{safe_url}">Открыть в sto.autoimba.ru</a>')
 
-    message = "\n".join(lines)
+message = "\n".join(lines)
     sent = 0
     failed = 0
 
