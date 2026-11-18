@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import json
 import os
 import secrets
@@ -8,9 +9,8 @@ import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from html import escape
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -27,7 +27,10 @@ BOT_TOKEN = required_env("TELEGRAM_BOT_TOKEN")
 API_SECRET = required_env("NOTIFIER_API_SECRET")
 WEBHOOK_SECRET = required_env("TELEGRAM_WEBHOOK_SECRET")
 
-BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "expressautomaster24_bot").lstrip("@")
+BOT_USERNAME = os.getenv(
+    "TELEGRAM_BOT_USERNAME",
+    "expressautomaster24_bot",
+).lstrip("@")
 DB_PATH = os.getenv("DATABASE_PATH", "/app/data/notifier.sqlite3")
 
 app = FastAPI(title="Autoservice Telegram Notifier")
@@ -40,6 +43,7 @@ def db():
 
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+
     try:
         conn.execute(
             """
@@ -64,8 +68,10 @@ def db():
             """
         )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant "
-            "ON subscriptions(tenant_id)"
+            """
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_tenant
+            ON subscriptions(tenant_id)
+            """
         )
         conn.commit()
         yield conn
@@ -84,7 +90,11 @@ def telegram(method: str, payload: dict) -> None:
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
             result = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        json.JSONDecodeError,
+    ) as exc:
         raise RuntimeError("Telegram API недоступен") from exc
 
     if not result.get("ok"):
@@ -93,7 +103,11 @@ def telegram(method: str, payload: dict) -> None:
 
 def verify_authorization(authorization: Optional[str]) -> None:
     expected = "Bearer " + API_SECRET
-    if not authorization or not hmac.compare_digest(authorization, expected):
+
+    if not authorization or not hmac.compare_digest(
+        authorization,
+        expected,
+    ):
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
@@ -109,10 +123,10 @@ class EventRequest(BaseModel):
     starts_at: str = Field(default="", max_length=80)
     vehicle: str = Field(default="", max_length=160)
     description: str = Field(default="", max_length=500)
-    appointment_url: str = Field(default="", max_length=500)
     client_name: str = Field(default="", max_length=200)
     client_phone: str = Field(default="", max_length=40)
     amount: Optional[float] = None
+    appointment_url: str = Field(default="", max_length=500)
 
 
 @app.get("/health")
@@ -139,15 +153,27 @@ def create_link(
         )
         conn.execute(
             """
-            INSERT INTO link_codes(code_hash, user_id, tenant_id, created_at, expires_at)
+            INSERT INTO link_codes (
+                code_hash, user_id, tenant_id, created_at, expires_at
+            )
             VALUES (?, ?, ?, ?, ?)
             """,
-            (code_hash, item.user_id, item.tenant_id, now, expires_at),
+            (
+                code_hash,
+                item.user_id,
+                item.tenant_id,
+                now,
+                expires_at,
+            ),
         )
         conn.commit()
 
     link = f"https://t.me/{BOT_USERNAME}?start={quote(code, safe='')}"
-    return {"url": link, "link": link, "expires_at": expires_at}
+    return {
+        "url": link,
+        "link": link,
+        "expires_at": expires_at,
+    }
 
 
 @app.get("/api/link/{user_id}")
@@ -195,7 +221,10 @@ def delete_link(
         )
         conn.commit()
 
-    return {"ok": True, "deleted": cursor.rowcount}
+    return {
+        "ok": True,
+        "deleted": cursor.rowcount,
+    }
 
 
 @app.post("/telegram/webhook")
@@ -214,8 +243,11 @@ async def telegram_webhook(
 
     try:
         update = await request.json()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid_json")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_json",
+        ) from exc
 
     message = update.get("message") or {}
     text = message.get("text", "")
@@ -226,6 +258,7 @@ async def telegram_webhook(
 
     parts = text.split(maxsplit=1)
     command = parts[0].split("@", 1)[0] if parts else ""
+
     if command != "/start":
         return {"ok": True}
 
@@ -249,13 +282,20 @@ async def telegram_webhook(
             if row:
                 conn.execute(
                     """
-                    INSERT INTO subscriptions(user_id, tenant_id, chat_id, linked_at)
+                    INSERT INTO subscriptions (
+                        user_id, tenant_id, chat_id, linked_at
+                    )
                     VALUES (?, ?, ?, ?)
                     ON CONFLICT(user_id, chat_id) DO UPDATE SET
                         tenant_id = excluded.tenant_id,
                         linked_at = excluded.linked_at
                     """,
-                    (row["user_id"], row["tenant_id"], str(chat_id), now),
+                    (
+                        row["user_id"],
+                        row["tenant_id"],
+                        str(chat_id),
+                        now,
+                    ),
                 )
                 conn.execute(
                     "DELETE FROM link_codes WHERE code_hash = ?",
@@ -265,12 +305,74 @@ async def telegram_webhook(
                 reply = "🔔 Уведомления sto.autoimba.ru подключены."
 
     try:
-        telegram("sendMessage", {"chat_id": chat_id, "text": reply})
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": reply,
+            },
+        )
     except RuntimeError:
-        # Не провоцируем повторную доставку webhook от Telegram.
+        # Не вызываем повторную доставку webhook из-за ошибки Telegram.
         pass
 
     return {"ok": True}
+
+
+def build_event_message(item: EventRequest) -> str:
+    labels = {
+        "new": "🆕 Новая запись",
+        "updated": "✏️ Запись изменена",
+        "cancelled": "❌ Запись отменена",
+        "completed_paid": "✅ Заказ выполнен",
+    }
+    label = labels.get(
+        item.event_type,
+        f"🔔 Событие: {item.event_type}",
+    )
+
+    lines = [f"<b>{html.escape(label)}</b>"]
+
+    if item.event_id:
+        lines.append(
+            f"Запись: {html.escape(item.event_id)}"
+        )
+    if item.client_name:
+        lines.append(
+            f"Клиент: {html.escape(item.client_name)}"
+        )
+    if item.client_phone:
+        lines.append(
+            f"Телефон: {html.escape(item.client_phone)}"
+        )
+    if item.starts_at:
+        lines.append(
+            f"Время: {html.escape(item.starts_at)}"
+        )
+    if item.vehicle:
+        lines.append(
+            f"Автомобиль: {html.escape(item.vehicle)}"
+        )
+    if item.description:
+        lines.append(
+            f"Детали: {html.escape(item.description)}"
+        )
+    if item.amount is not None:
+        amount_text = f"{item.amount:,.2f}".replace(",", " ")
+        lines.append(f"Сумма: {amount_text} ₽")
+
+    if item.appointment_url:
+        parsed_url = urlparse(item.appointment_url)
+        if (
+            parsed_url.scheme == "https"
+            and parsed_url.netloc == "sto.autoimba.ru"
+        ):
+            safe_url = html.escape(item.appointment_url, quote=True)
+            lines.append(
+                f'<a href="{safe_url}">Открыть в sto.autoimba.ru</a>'
+            )
+
+    return "\n".join(lines)
 
 
 @app.post("/api/events")
@@ -279,35 +381,25 @@ def notify_event(
     authorization: Optional[str] = Header(default=None),
 ):
     verify_authorization(authorization)
+    message = build_event_message(item)
 
-    labels = {
-    "new": "🆕 Новая запись",
-    "updated": "✏️ Запись изменена",
-    "cancelled": "❌ Запись отменена",
-    "completed_paid": "✅ Заказ выполнен",
-}
-label = labels.get(item.event_type, f"🔔 Событие: {item.event_type}")
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT chat_id
+            FROM subscriptions
+            WHERE tenant_id = ?
+            """,
+            (item.tenant_id,),
+        ).fetchall()
 
-lines = [f"<b>{escape(label)}</b>"]
+    if not rows:
+        return {
+            "ok": True,
+            "sent": 0,
+            "failed": 0,
+        }
 
-if item.client_name:
-    lines.append(f"Клиент: {escape(item.client_name)}")
-if item.client_phone:
-    lines.append(f"Телефон: {escape(item.client_phone)}")
-if item.starts_at:
-    lines.append(f"Время: {escape(item.starts_at)}")
-if item.vehicle:
-    lines.append(f"Автомобиль: {escape(item.vehicle)}")
-if item.description:
-    lines.append(f"Детали: {escape(item.description)}")
-if item.amount is not None:
-    lines.append(f"Сумма: {item.amount:,.2f} ₽".replace(",", " "))
-
-if item.appointment_url:
-    safe_url = escape(item.appointment_url, quote=True)
-    lines.append(f'<a href="{safe_url}">Открыть в sto.autoimba.ru</a>')
-
-message = "\n".join(lines)
     sent = 0
     failed = 0
 
@@ -326,13 +418,24 @@ message = "\n".join(lines)
             failed += 1
 
     if failed and not sent:
-        raise HTTPException(status_code=502, detail="telegram_delivery_failed")
+        raise HTTPException(
+            status_code=502,
+            detail="telegram_delivery_failed",
+        )
 
-    return {"ok": True, "sent": sent, "failed": failed}
+    return {
+        "ok": True,
+        "sent": sent,
+        "failed": failed,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    port = int(os.getenv("PORT", "3000"))
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+    )
